@@ -19,8 +19,8 @@ interface SkippedRow {
 }
 
 function parseTimeWindow(text: string): SupplementTimeWindow | null {
-  const lower = text.toLowerCase();
-  if (lower.includes('morning') || lower.includes('7am')) return 'morning';
+  const lower = text.toLowerCase().trim();
+  if (lower.includes('first thing') || lower.includes('morning') || lower.includes('7am')) return 'morning';
   if (lower.includes('breakfast') || lower.includes('8am')) return 'breakfast';
   if (lower.includes('lunch') || lower.includes('12pm')) return 'lunch';
   if (lower.includes('dinner') || lower.includes('6pm')) return 'dinner';
@@ -36,79 +36,121 @@ export default function UploadSupplements({ onBack }: { onBack: () => void }) {
   const [skippedRows, setSkippedRows] = useState<SkippedRow[]>([]);
   const [step, setStep] = useState<'upload' | 'preview' | 'done'>('upload');
   const [uploading, setUploading] = useState(false);
+  const [parsing, setParsing] = useState(false);
+  const [uploadError, setUploadError] = useState<string | null>(null);
   const [importedCount, setImportedCount] = useState(0);
+
+  // Safari-safe: wrap FileReader in a Promise rather than using file.arrayBuffer()
+  const readFileAsArrayBuffer = (file: File): Promise<ArrayBuffer> =>
+    new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        const result = e.target?.result;
+        if (result instanceof ArrayBuffer) resolve(result);
+        else reject(new Error('Failed to read file as ArrayBuffer'));
+      };
+      reader.onerror = () => reject(new Error('FileReader error'));
+      reader.readAsArrayBuffer(file);
+    });
 
   const handleFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
+    // Reset input so the same file can be re-selected after cancel
+    e.target.value = '';
     if (!file) return;
 
-    const buffer = await file.arrayBuffer();
-    const workbook = read(buffer);
-    const sheet = workbook.Sheets[workbook.SheetNames[0]];
-    const rows = utils.sheet_to_json<string[]>(sheet, { header: 1 });
+    setParsing(true);
+    setUploadError(null);
 
-    const valid: ParsedRow[] = [];
-    const skipped: SkippedRow[] = [];
+    try {
+      const buffer = await readFileAsArrayBuffer(file);
+      const workbook = read(buffer);
+      const sheet = workbook.Sheets[workbook.SheetNames[0]];
+      const rows = utils.sheet_to_json<string[]>(sheet, { header: 1 });
 
-    for (let i = 1; i < rows.length; i++) {
-      const row = rows[i];
-      if (!row || row.length === 0) continue;
+      const valid: ParsedRow[] = [];
+      const skipped: SkippedRow[] = [];
 
-      const name = String(row[0] ?? '').trim();
-      const timeText = String(row[1] ?? '').trim();
-      const quantity = String(row[2] ?? '').trim();
-      const description = String(row[3] ?? '').trim();
+      for (let i = 1; i < rows.length; i++) {
+        const row = rows[i];
+        if (!row || row.length === 0) continue;
 
-      if (!name) {
-        skipped.push({ row: i + 1, reason: 'Missing supplement name (Col A)' });
-        continue;
+        const name = String(row[0] ?? '').trim();
+        const timeText = String(row[1] ?? '').trim();
+        const quantity = String(row[2] ?? '').trim();
+        const description = String(row[3] ?? '').trim();
+
+        if (!name) {
+          skipped.push({ row: i + 1, reason: 'Missing supplement name (Col A)' });
+          continue;
+        }
+        const timeWindow = parseTimeWindow(timeText);
+        if (!timeWindow) {
+          skipped.push({ row: i + 1, reason: `Cannot map time window: "${timeText}"` });
+          continue;
+        }
+        if (!quantity) {
+          skipped.push({ row: i + 1, reason: 'Missing quantity (Col C)' });
+          continue;
+        }
+
+        valid.push({ name, timeWindow, quantity, description });
       }
-      const timeWindow = parseTimeWindow(timeText);
-      if (!timeWindow) {
-        skipped.push({ row: i + 1, reason: `Cannot map time window: "${timeText}"` });
-        continue;
-      }
-      if (!quantity) {
-        skipped.push({ row: i + 1, reason: 'Missing quantity (Col C)' });
-        continue;
-      }
 
-      valid.push({ name, timeWindow, quantity, description });
+      setValidRows(valid);
+      setSkippedRows(skipped);
+      setStep('preview');
+    } catch (err) {
+      setUploadError(err instanceof Error ? err.message : 'Failed to read file. Please try again.');
+    } finally {
+      setParsing(false);
     }
-
-    setValidRows(valid);
-    setSkippedRows(skipped);
-    setStep('preview');
   };
 
   const handleConfirm = async () => {
-    if (!user || !activePatientId) return;
+    if (!user) {
+      setUploadError('You must be signed in to upload supplements.');
+      return;
+    }
+    if (!activePatientId) {
+      setUploadError('No active patient selected. Go to Settings and add a patient first.');
+      return;
+    }
+
     setUploading(true);
+    setUploadError(null);
 
-    const rows = validRows.map(r => ({
-      user_id: user.id,
-      patient_id: activePatientId,
-      name: r.name,
-      time_window: r.timeWindow,
-      quantity: r.quantity,
-      description: r.description,
-    }));
+    try {
+      const rows = validRows.map(r => ({
+        user_id: user.id,
+        patient_id: activePatientId,
+        name: r.name,
+        time_window: r.timeWindow,
+        quantity: r.quantity,
+        description: r.description,
+      }));
 
-    // Delete existing entries for this patient then insert new ones
-    await supabase
-      .from('supplement_database')
-      .delete()
-      .eq('user_id', user.id)
-      .eq('patient_id', activePatientId);
+      // Delete existing entries for this patient then insert new ones
+      const { error: deleteError } = await supabase
+        .from('supplement_database')
+        .delete()
+        .eq('user_id', user.id)
+        .eq('patient_id', activePatientId);
 
-    const { error } = await supabase.from('supplement_database').insert(rows);
+      if (deleteError) throw new Error(`Failed to clear old data: ${deleteError.message}`);
 
-    if (!error) {
+      const { error: insertError } = await supabase.from('supplement_database').insert(rows);
+
+      if (insertError) throw new Error(`Failed to save supplements: ${insertError.message}`);
+
       setImportedCount(rows.length);
       await loadSupplementDatabase(activePatientId);
       setStep('done');
+    } catch (err) {
+      setUploadError(err instanceof Error ? err.message : 'Upload failed. Please try again.');
+    } finally {
+      setUploading(false);
     }
-    setUploading(false);
   };
 
   const timeWindowLabels: Record<SupplementTimeWindow, string> = {
@@ -144,10 +186,11 @@ export default function UploadSupplements({ onBack }: { onBack: () => void }) {
 
             <button
               onClick={() => fileRef.current?.click()}
-              className="w-full bg-violet-600 text-white rounded-2xl py-4 flex items-center justify-center gap-2 font-medium min-h-[44px] active:scale-[0.98]"
+              disabled={parsing}
+              className="w-full bg-violet-600 text-white rounded-2xl py-4 flex items-center justify-center gap-2 font-medium min-h-[44px] active:scale-[0.98] disabled:opacity-50"
             >
               <Upload size={20} />
-              Choose Excel File
+              {parsing ? 'Reading file…' : 'Choose Excel File'}
             </button>
             <input
               ref={fileRef}
@@ -156,6 +199,11 @@ export default function UploadSupplements({ onBack }: { onBack: () => void }) {
               className="hidden"
               onChange={handleFile}
             />
+            {uploadError && (
+              <div className="bg-red-50 border border-red-200 rounded-2xl p-4">
+                <p className="text-sm text-red-700">{uploadError}</p>
+              </div>
+            )}
           </>
         )}
 
@@ -199,16 +247,22 @@ export default function UploadSupplements({ onBack }: { onBack: () => void }) {
               </div>
             )}
 
+            {uploadError && (
+              <div className="bg-red-50 border border-red-200 rounded-2xl p-4">
+                <p className="text-sm text-red-700">{uploadError}</p>
+              </div>
+            )}
+
             <div className="flex gap-3">
               <button
-                onClick={() => { setStep('upload'); setValidRows([]); setSkippedRows([]); }}
+                onClick={() => { setStep('upload'); setValidRows([]); setSkippedRows([]); setUploadError(null); }}
                 className="flex-1 bg-slate-200 text-slate-700 rounded-2xl py-3 font-medium min-h-[44px] active:scale-[0.98]"
               >
                 Cancel
               </button>
               <button
                 onClick={handleConfirm}
-                disabled={uploading}
+                disabled={uploading || validRows.length === 0}
                 className="flex-1 bg-violet-600 text-white rounded-2xl py-3 font-medium min-h-[44px] active:scale-[0.98] disabled:opacity-50"
               >
                 {uploading ? 'Uploading…' : 'Confirm Upload'}
