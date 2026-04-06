@@ -34,10 +34,23 @@ export function AppProvider({ children }: { children: ReactNode }) {
       .from('patients')
       .select('id, name')
       .eq('user_id', user.id);
+
     if (data && data.length > 0) {
       setPatients(data);
       if (!activePatientId) {
         setActivePatientIdState(data[0].id);
+      }
+    } else {
+      // Table exists but no patient record — create default "Me" (happens when
+      // the user signed up before the patients table was created in Supabase)
+      const { data: created } = await supabase
+        .from('patients')
+        .insert({ user_id: user.id, name: 'Me' })
+        .select()
+        .single();
+      if (created) {
+        setPatients([{ id: created.id, name: created.name }]);
+        setActivePatientIdState(created.id);
       }
     }
   }, [user, activePatientId]);

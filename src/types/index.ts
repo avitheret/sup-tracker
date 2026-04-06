@@ -1,4 +1,4 @@
-export const APP_VERSION = '1.0.3';
+export const APP_VERSION = '1.0.4';
 
 export const SUPPLEMENT_TIME_WINDOWS = {
   morning:   { label: 'First thing in the morning', start: '07:00', end: '08:00' },
