@@ -38,6 +38,7 @@ export default function UploadSupplements({ onBack }: { onBack: () => void }) {
   const [uploading, setUploading] = useState(false);
   const [parsing, setParsing] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
+  const [dbNotSetUp, setDbNotSetUp] = useState(false);
   const [importedCount, setImportedCount] = useState(0);
 
   // Safari-safe: wrap FileReader in a Promise rather than using file.arrayBuffer()
@@ -137,17 +138,32 @@ export default function UploadSupplements({ onBack }: { onBack: () => void }) {
         .eq('user_id', user.id)
         .eq('patient_id', activePatientId);
 
-      if (deleteError) throw new Error(`Failed to clear old data: ${deleteError.message}`);
+      if (deleteError) {
+        if (deleteError.message.includes('schema cache') || deleteError.code === 'PGRST205') {
+          throw new Error('DATABASE_NOT_SET_UP');
+        }
+        throw new Error(`Failed to clear old data: ${deleteError.message}`);
+      }
 
       const { error: insertError } = await supabase.from('supplement_database').insert(rows);
 
-      if (insertError) throw new Error(`Failed to save supplements: ${insertError.message}`);
+      if (insertError) {
+        if (insertError.message.includes('schema cache') || insertError.code === 'PGRST205') {
+          throw new Error('DATABASE_NOT_SET_UP');
+        }
+        throw new Error(`Failed to save supplements: ${insertError.message}`);
+      }
 
       setImportedCount(rows.length);
       await loadSupplementDatabase(activePatientId);
       setStep('done');
     } catch (err) {
-      setUploadError(err instanceof Error ? err.message : 'Upload failed. Please try again.');
+      const msg = err instanceof Error ? err.message : 'Upload failed. Please try again.';
+      if (msg === 'DATABASE_NOT_SET_UP') {
+        setDbNotSetUp(true);
+      } else {
+        setUploadError(msg);
+      }
     } finally {
       setUploading(false);
     }
@@ -171,6 +187,59 @@ export default function UploadSupplements({ onBack }: { onBack: () => void }) {
       </div>
 
       <div className="p-4 space-y-4">
+        {dbNotSetUp && (
+          <div className="bg-amber-50 border border-amber-300 rounded-2xl p-4 space-y-3">
+            <p className="font-semibold text-amber-900">Database tables not set up</p>
+            <p className="text-sm text-amber-800">Run this SQL in your Supabase project (SQL Editor → New query):</p>
+            <pre className="text-xs bg-amber-100 rounded-xl p-3 overflow-x-auto text-amber-900 whitespace-pre-wrap">{`create table if not exists patients (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid references auth.users(id) on delete cascade not null,
+  name text not null,
+  created_at timestamptz default now()
+);
+alter table patients enable row level security;
+create policy "users manage own patients" on patients
+  for all using (auth.uid() = user_id);
+
+create table if not exists supplement_database (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid references auth.users(id) on delete cascade not null,
+  patient_id text not null,
+  name text not null,
+  time_window text not null,
+  quantity text not null,
+  description text not null,
+  created_at timestamptz default now()
+);
+alter table supplement_database enable row level security;
+create policy "users manage own" on supplement_database
+  for all using (auth.uid() = user_id);
+
+create table if not exists supplement_logs (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid references auth.users(id) on delete cascade not null,
+  patient_id text not null,
+  name text not null,
+  quantity text not null,
+  time_window text not null,
+  taken_at timestamptz default now(),
+  date text not null,
+  notes text default '',
+  created_at timestamptz default now()
+);
+alter table supplement_logs enable row level security;
+create policy "users manage own logs" on supplement_logs
+  for all using (auth.uid() = user_id);`}</pre>
+            <p className="text-xs text-amber-700">After running the SQL, sign out and sign back in, then try again.</p>
+            <button
+              onClick={() => setDbNotSetUp(false)}
+              className="text-sm text-amber-700 underline min-h-[44px]"
+            >
+              Dismiss
+            </button>
+          </div>
+        )}
+
         {step === 'upload' && (
           <>
             <div className="bg-white rounded-2xl shadow-sm border border-slate-100 p-4 space-y-3">
